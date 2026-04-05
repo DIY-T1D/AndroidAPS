@@ -17,11 +17,10 @@ on:
           - aapsclient2Debug
           - pumpcontrolRelease
           - pumpcontrolDebug
-  release:
-    types: [released]
   push:
     branches:
       - master
+      - dev
 
 jobs:
   build:
