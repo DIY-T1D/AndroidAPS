@@ -1,6 +1,7 @@
 name: AAPS CI
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       tagName:
@@ -54,10 +55,6 @@ on:
           - aapsclient2Debug
           - pumpcontrolRelease
           - pumpcontrolDebug
-  push:
-    branches:
-      - master
-      - dev
 
 jobs:
   build:
