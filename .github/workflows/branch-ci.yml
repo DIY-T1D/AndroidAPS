@@ -1,6 +1,9 @@
 name: Branch CI
 
 on:
+  push:
+    branches:
+      - dev
   workflow_dispatch:
     inputs:
       buildVariant:
@@ -158,7 +161,8 @@ jobs:
 
       - name: Set BUILD_VARIANT
         run: |
-          BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"
+          if [[ "${{ github.event.inputs.buildVariant }}" == "" ]]; then BUILD_VARIANT="fullRelease"; fi
+          if [[ "${{ github.event.inputs.buildVariant }}" != "" ]]; then BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"; fi
           echo "BUILD_VARIANT=$BUILD_VARIANT" >> $GITHUB_ENV
           VARIANT_FLAVOR=$(echo "$BUILD_VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
           VARIANT_TYPE=$(echo "$BUILD_VARIANT" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
