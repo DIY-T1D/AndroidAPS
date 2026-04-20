@@ -1,9 +1,6 @@
 name: AAPS CI
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       tagName:
@@ -221,8 +218,7 @@ jobs:
 
       - name: Set BUILD_VARIANT
         run: |
-          if [[ "${{ github.event.inputs.buildVariant }}" == "" ]]; then BUILD_VARIANT="fullRelease"; fi
-          if [[ "${{ github.event.inputs.buildVariant }}" != "" ]]; then BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"; fi
+          BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"
           echo "BUILD_VARIANT=$BUILD_VARIANT" >> $GITHUB_ENV
           VARIANT_FLAVOR=$(echo "$BUILD_VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
           VARIANT_TYPE=$(echo "$BUILD_VARIANT" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
