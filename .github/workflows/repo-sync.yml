@@ -20,7 +20,8 @@ jobs:
       - name: Sync Dev Branch
         uses: tgymnich/fork-sync@v2
         with:
-          owner: DIY-T1D
           base: dev
           head: dev
+          pr_title: "Merge"
+          merge_method: "merge"
           token: ${{ secrets.GH_PAT }}
