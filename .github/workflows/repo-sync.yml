@@ -2,7 +2,7 @@ name: Repo Sync
 
 on:
   schedule:
-  - cron:  "0 4/12 * * *"
+  - cron:  "45 3/12 * * *"
   workflow_dispatch:
 
 jobs:
