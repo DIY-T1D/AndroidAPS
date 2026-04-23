@@ -1,6 +1,10 @@
 name: Branch CI
 
 on:
+  push:
+    branches:
+      - master
+      - dev
   workflow_dispatch:
     inputs:
       buildVariant:
@@ -150,6 +154,9 @@ jobs:
 
       - name: Checkout source code
         uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          persist-credentials: false
 
       - name: Load jdk versions
         run: |
@@ -158,7 +165,8 @@ jobs:
 
       - name: Set BUILD_VARIANT
         run: |
-          BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"
+          BUILD_VARIANT_TEMP="${{ github.event.inputs.buildVariant }}"
+          BUILD_VARIANT=${BUILD_VARIANT_TEMP:-"fullRelease"}
           echo "BUILD_VARIANT=$BUILD_VARIANT" >> $GITHUB_ENV
           VARIANT_FLAVOR=$(echo "$BUILD_VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
           VARIANT_TYPE=$(echo "$BUILD_VARIANT" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
