@@ -11,8 +11,8 @@ import app.aaps.core.data.ue.Sources
 import app.aaps.core.data.ue.ValueWithUnit
 import app.aaps.core.interfaces.aps.Loop
 import app.aaps.core.interfaces.db.PersistenceLayer
-import app.aaps.core.interfaces.profile.LocalProfileManager
 import app.aaps.core.interfaces.profile.ProfileFunction
+import app.aaps.core.interfaces.profile.ProfileRepository
 import app.aaps.core.interfaces.pump.DetailedBolusInfo
 import app.aaps.core.interfaces.pump.PumpEnactResult
 import app.aaps.core.interfaces.pump.PumpSync
@@ -58,7 +58,7 @@ class RunningModeReconcilerIntegrationTest @Inject constructor() {
     @Inject lateinit var rxHelper: RxHelper
     @Inject lateinit var loop: Loop
     @Inject lateinit var profileFunction: ProfileFunction
-    @Inject lateinit var localProfileManager: LocalProfileManager
+    @Inject lateinit var profileRepository: ProfileRepository
     @Inject lateinit var nsIncomingDataProcessor: NsIncomingDataProcessor
     @Inject lateinit var pumpSync: PumpSync
 
@@ -73,12 +73,22 @@ class RunningModeReconcilerIntegrationTest @Inject constructor() {
         // TestApplication does not start the reconciler / scheduler on its own — start them here.
         runningModeReconciler.start()
         runningModeExpiryScheduler.start()
+        // Drain late-arriving commands from the previous test's appScope coroutines (e.g. the
+        // reconciler is still inside commandQueue.tempBasalPercent when tearDown clears the queue,
+        // and the `add()` lands after the clear). Sleep briefly to let those coroutines reach
+        // their `add()` call site, then clear the queue once more.
+        Thread.sleep(200)
+        commandQueue.clear()
     }
 
     @After
     fun tearDown() {
         rxHelper.clear()
         WorkManager.getInstance(context).cancelAllWork()
+        // Reset queue state: `performing` is a singleton field and survives WorkManager.cancelAllWork().
+        // Without this, a long-running command (e.g. a virtual-pump bolus simulating delivery via
+        // SystemClock.sleep) leaves `performing != null`, and the next test's QueueWorker spins.
+        commandQueue.clear()
         runBlocking { persistenceLayer.clearDatabases() }
     }
 
@@ -368,7 +378,7 @@ class RunningModeReconcilerIntegrationTest @Inject constructor() {
         ) return
 
         nsIncomingDataProcessor.processProfile(JSONObject(profileData), false)
-        val store = localProfileManager.profile ?: error("no profile store after NS import")
+        val store = profileRepository.profile.value ?: error("no profile store after NS import")
         val defaultName = store.getDefaultProfileName() ?: error("no default profile name")
         profileFunction.createProfileSwitch(
             profileStore = store,
