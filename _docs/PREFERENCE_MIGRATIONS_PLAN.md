@@ -26,7 +26,7 @@ pump changed with `verifyPumpIdentification(type, pump.serialNumber())`, right a
 answer it with a `reset()`. The reset itself is fine: it clears the in-memory copy, and the next
 connection reads it again. But until then the live serial is `""`, so at that moment the check
 cannot tell an unchanged pump from a new one and may report "changed": `connectNewPump()` ends the
-running temporary basal in the database, and `completeAllAsNoOp()` drops the queued commands. The
+running temporary basal in the database, and `cancelAll()` drops the queued commands. The
 next loop cycle and the next connection heal both, so the effect is small. Dev only (`dee57d5` is
 not released).
 
@@ -335,8 +335,12 @@ Then one app-scoped job that the screen cannot cancel:
 5. `commandQueue.withHold { ... }`, and pause client-control processing. If the pump does not
    settle, nothing is written.
 6. Write in one `edit(commit = true)`: settings from the map replace the old settings; device
-   state stays. **No `sp.clear()`.** On a master, imported Bidirectional keys get a stamp of
-   `max(stored + 1, now)` in the same write; a client writes no stamps and follows the master.
+   state stays. **No `sp.clear()`** - it would take the pump keys with it. Removing what the file
+   does not have is done by iterating the stored keys instead, and the rule for that, with its two
+   preconditions, is **4.1 decision 4**. Removal is the point of this step, not a side effect: an
+   import has to clear out what earlier versions left behind. On a master, imported Bidirectional
+   keys get a stamp of `max(stored + 1, now)` in the same write; a client writes no stamps and
+   follows the master.
 7. Log `IMPORT_SETTINGS`.
 8. Reload and apply (3.5).
 
@@ -392,8 +396,8 @@ The one thing a plugin really must do itself is in 3.6.
    2. Stop `AutomationRuntime` and wait for a run in progress (its run mutex).
    3. Cancel or wait for the running calculation.
    4. Nothing runs now and nothing can queue a command: cancel every queued command
-      (`completeAllAsNoOp()`), write the store (3.4 step 6), then `reloadFromStore()` (step 1
-      above).
+      (`cancelAll(comment, success = false)` - `completeAllAsNoOp()` is gone, see 4.1 decision 3),
+      write the store (3.4 step 6), then `reloadFromStore()` (step 1 above).
    5. Start every enabled plugin, awaited, in order (`setPluginEnabledAwaiting`), then
       `AutomationRuntime.start()`, which re-reads the rules.
    6. Trigger a new calculation.
@@ -496,11 +500,250 @@ Each of these changes what gets built, and none of them is a coding question.
    default. A `kind` with no default breaks every key enum at once and has to be filled in one pass.
    Two very different pieces of work; phase 1 cannot start without the answer.
 2. **What is the quiet point**, given that nothing can stop the loop between the temp basal and the
-   SMB (8.A)? Until this is answered, "nothing runs now" is a wish.
-3. **What does "cancel the queued commands" mean**, given that `completeAllAsNoOp` reports
-   `success = true` and the loop reads that as enacted (8.A)?
-4. **Replace or merge?** Dropping `sp.clear()` changes what an import means, and the removal rule is
-   not written anywhere (8.B).
+   SMB (8.A)? **HALF SETTLED AND BUILT; the other half is specified below and not built.**
+
+   - **The queue half is done** (`21570ca902`). The recommendation below - do not stop the loop, stop a
+     new enactment from starting - is implemented as `&& !commandQueue.isHeld()` in `LoopPlugin.invoke`
+     and as an early return in `LoopPlugin.acceptChangeRequest` and
+     `RunningModeReconciler.issueZeroTbrIfNeeded`. Two of the three have tests proven red without the
+     guard; `invoke` does not, and that gap is deliberate rather than overlooked.
+   - **The plugin-state half is NOT done, and it is the one users are hitting.** The hold stops commands;
+     it does nothing about a plugin reading plugin state while the selection is being rebuilt. Live
+     Crashlytics `PluginStore.getActivePumpInternal` - "No pump selected", 13 events / 6 users on
+     `4.0.0-dev`..`dev-c`, newest 2026-09-16 - happens inside the window where `loadSettings` has
+     disabled the old pump and not yet elected the new one. The `config.appInitialized` guards that
+     several plugins carry were PRESENT in those builds and were passed, because `appInitialized` means
+     "start up finished once", not "plugin state is valid now"; that is the part of the diagnosis that
+     holds, and it is what decides the fix.
+
+     **The caller that produced those events is `PersistentNotificationPlugin`, and its path is already
+     closed** - by RxJava's undeliverable-exception behaviour, not by anything anyone designed, and by
+     the Rx-to-Flow migration that removed it. Both are set out below. What is NOT established is
+     whether any *other* reader is still uncontained in this window; that is the first task of the
+     session that builds this. It does not block the design: the fix is the same wherever the read is,
+     because it is about the window, not the call site.
+
+     **The answer is not to soften the throw.** `PluginStore`'s "No pump selected" and its `checkNotNull`
+     siblings are deliberate assertions - no nullable variant, no default fallback, no cached
+     last-known value, no try/catch at a call site. See the comment block above the interface section
+     of `PluginStore.kt`.
+
+     **What to build instead:** a separate `reconfiguring` state on `Config`, with
+     `appInitialized = initProgressFlow.value.done && !reconfiguring`. Every one of the ~15 existing
+     `if (!config.appInitialized) return` guards then closes during an import, with no call-site changes.
+
+     **Do NOT implement this by clearing `initProgressFlow.done`.** A six-dimension consequence analysis
+     (2026-09-21, 30 findings, 16 refuted) returned seven independent blockers on that, all the same one:
+     `done` is also the splash gate. `AapsAppRoot` renders
+     `AnimatedVisibility(visible = !initProgress.done) { SplashScreen(...) }` over
+     `AnimatedVisibility(visible = initProgress.done) { content(navController) }`, and `AnimatedVisibility`
+     REMOVES the subtree from composition. Clearing `done` would (a) put the splash over a running app for
+     up to 30 s with stale boot text, (b) take the import screen performing the apply off the display,
+     (c) dispose and re-run every screen's `LaunchedEffect` on restore - including
+     `LaunchedEffect(source) { importViewModel.startImport(source) }`, which writes `ImportStep.FilePicker`
+     to the same `_importStep` that `onApplyConfirmed` writes `Applied`/`ApplyFailed` to, with no ordering
+     - and (d) hide `ImportStep.ApplyFailed`, the only screen offering `retryApply()`, behind a splash with
+     no Close button, after the settings are already on disk. It also re-introduces exactly what
+     `ImportViewModel.finishApply` already defers `uiRestart.request()` to avoid.
+
+     **A `CoroutineStart.UNDISPATCHED` mechanism was written here on 2026-09-21 and is REFUTED. There
+     is no cheap local fix; do not build one.** The claim was that
+     `PersistentNotificationPlugin.onStart` subscribes three collectors with
+     `collectResilient(..., start = CoroutineStart.UNDISPATCHED)`, so the collector body runs on the
+     caller's thread inside `onStart` and its throw escapes. The body does run on the caller's thread -
+     that part of `ResilientCollect.kt`'s KDoc is accurate - but the throw cannot escape, because
+     `collectResilient` is
+
+         onEach { item -> try { block(item) } catch (CancellationException) { throw } catch (Throwable) { log } }
+             .retryWhen { ... }
+             .let { flow -> scope.launch(start = start) { flow.collect() } }
+
+     The try/catch is INSIDE `onEach`, upstream of the `launch`. `start` selects which thread the
+     launched coroutine runs on up to its first suspension; it does not move `block` outside that catch.
+     So a throw from `triggerNotificationUpdate()` is logged and swallowed either way, and this plugin
+     cannot be the crash source in any build that has `collectResilient` (`c42bde3538`, 2026-08-14).
+     Its `config.appInitialized` guard came from `94a43687fa`, 2023-08-21, whose commit message is
+     "fix crash" - the same bug, patched locally, three years earlier.
+
+     **The real mechanism, from the code the crashing builds actually ran: RxJava.** At `88820c9811`
+     this `onStart` was three `rxBus.toObservable(...).observeOn(aapsSchedulers.io)
+     .subscribe({ triggerNotificationUpdate() }, fabricPrivacy::logException)`. A throw from an
+     RxJava `onNext` lambda is **not** routed to the `onError` handler next to it - it is wrapped as an
+     `UndeliverableException` and rethrown on the scheduler thread, which on Android ends the process.
+     So `fabricPrivacy::logException` never saw it, and the "No pump selected" assertion killed the app.
+
+     **That path was closed on 2026-08-15 by `202ad40fba` ("plugins/main listens on Flow")**, which
+     replaced those three subscriptions with `collectResilient` - incidentally, not deliberately, and
+     the per-emission catch is what does it. Crash events continue to 2026-09-16, which is a month
+     later; that is consistent with users still running `dev` builds older than that commit, since the
+     affected versions are `4.0.0-dev`..`dev-c`. **Check the build ids in Crashlytics before calling
+     this path fixed** - if any event is from a build at or after `202ad40fba`, the throw is coming from
+     somewhere else and this whole entry is wrong again.
+
+     The consequence for priority: this is no longer "six users are crashing today through a path that
+     still exists". The `reconfiguring` flag remains the right general answer, because the window is
+     real and other code reads the same accessors in it, but the urgency argument has to come from those
+     readers, not from this one.
+
+     Do not write another mechanism here without checking containment first: `PluginBase.runPhase`,
+     `collectResilient`, and `pluginScope`'s `CoroutineExceptionHandler` each swallow a throw, so
+     "reads `activePump` in the window" is not by itself a crash.
+
+     **Audited 2026-09-21: all 90 production files that read the five throwing accessors, 11 surveyors
+     and 102 adversarial verifiers. Zero confirmed crashes.** 101 of the 102 "this crashes" claims were
+     refuted outright and one downgraded to a behaviour bug (below). Two structural facts did most of
+     the refuting, and both are worth knowing before reading any future report:
+
+     - **`ActivePlugin.activePump` never throws.** It is `get() = pumpWithConcentration()`, a provider
+       that builds a `PumpWithConcentrationImpl`. Only *calling a member* on the result reaches
+       `activePumpInternal` and its assertion. So `val pump = activePlugin.activePump` is safe
+       everywhere, including in the import path, and a report that points at that line is pointing one
+       line too early.
+     - **`activePumpStore` is never deliberately set to null once elected.** The only assignments are
+       the initial `null`, `= getTheOneEnabledInArray(...)` and `= getDefaultPlugin(...)`. So for most
+       of an import `activePumpInternal` keeps answering with the previously elected pump.
+
+     Read that result for what it is: the verifiers were told to default to "refuted" when they could
+     not prove a crash, so it means **nothing survived a strict refutation**, not that the app cannot
+     crash. It is consistent with the RxJava finding above - the readers that used to race are now
+     contained, so the window is currently survivable rather than closed.
+
+     **The window the audit missed, found by reading the election itself.** `getTheOneEnabledInArray`
+     disables every enabled pump after the first *as it iterates*, and `verifySelectionInCategories`
+     then does:
+
+         activePumpStore = getTheOneEnabledInArray(pluginsInCategory, PluginType.PUMP, jobs) as Pump?
+         if (activePumpStore == null) { activePumpStore = getDefaultPlugin(PluginType.PUMP) as Pump ... }
+
+     The first line **can assign null** - that is what the `if` is for. Between the two lines both
+     `activePumpStore` and `firstEnabledIn(PluginType.PUMP)` can be null at once (nothing is enabled
+     yet, because the loop just disabled the runners-up and `loadPref` disabled the old pump), and a
+     reader on another thread hits `error("No pump selected")`. The stores are not `@Volatile` either,
+     so the visibility of these writes to other threads is unspecified. Two instructions wide, one
+     thread in a hundred - which is exactly the shape of 13 events across 6 users.
+
+     **This is not an argument for making that assignment atomic, and that fix is already rejected.**
+     Computing the election into a local and assigning once would mean a concurrent reader gets the
+     OLD, now-disabled pump - a stale pump driver, which is the silent-wrong-behaviour outcome the
+     comment block in `PluginStore` exists to prevent. The answer stays the one Miloš gave: the code
+     must not be reading plugin state in this window at all. This paragraph is evidence for the
+     `reconfiguring` flag, not an alternative to it.
+
+     **The one behaviour bug the audit did confirm:** `TriggerPumpBatteryLevel.shouldRun` (and its
+     siblings in `plugins/automation`) reads the pump during an apply and silently evaluates against
+     whichever pump is elected at that instant, so an automation rule can fire, or fail to fire, on the
+     wrong pump's battery. No crash. The flag closes it, because `AutomationRuntime` already has an
+     `if (!config.appInitialized) return`.
+
+     **What the window really is: `sp.clear()`, and it is already bracketed.**
+     `ImportExportPrefsImpl.executeImport` is `beforeImport()` / `sp.clear()` / rewrite every key /
+     `afterImport()`; `LocalImportExportPrefs.executeImport` brackets `transfer.applyImported` the same
+     way. Between the clear and the rewrite, every preference is gone - the plugin-selection keys
+     included. Both implementations delegate to `PluginStore.beforeImport()` / `afterImport()`, so that
+     pair is a single choke point for setting and clearing `reconfiguring`.
+
+     **Three constraints on the build, each found in the code on 2026-09-21:**
+
+     - **`reconfiguring` must be a `StateFlow`, not a `@Volatile Boolean`.** `Config.appInitialized` is
+       not the only consumer. `Config.awaitInitialized(timeoutMs)` returns early on `appInitialized`
+       (correct) and otherwise waits on `initProgressFlow.first { it.done }` - which is ALREADY true
+       during an import, so it returns instantly and every caller walks straight through. The callers
+       are `KeepAliveWorker`, which fires every five minutes and then calls `checkPump()`, and
+       `SceneExpiryRunner`. Give `Config` one combined ready flow and have both members read it.
+     - **The set/clear must be `try/finally`.** Neither `executeImport` has one today, so a throw from a
+       `putString` would skip `afterImport()`. A `reconfiguring` flag left set means `appInitialized` is
+       false for the rest of the process, and `WizardBolusExecutorImpl` refuses on it in two places: the
+       user cannot bolus. That is worse than the bug being fixed, and it is the evidence for the scoped
+       `config.whileApplyingSettings { }` + counter shape recommended below.
+     - **It must be cleared before `ImportViewModel.applySettings` reads the pump.** That function does
+       `val pump = activePlugin.activePump` immediately after `configBuilder.applyConfiguration()`.
+       A flag still set there fails every import - into `ImportStep.ApplyFailed` with the settings
+       already written to disk, which is the half-applied state the comment above it warns about.
+
+     **This window is not Android-only.** `ImportViewModel` is `commonMain`, and the iOS shell uses the
+     same one - `AapsAppHost.kt`, `metroViewModel<ImportViewModel>()` - so an iOS import opens and
+     closes the window through `IosClientConfig` exactly as Android does through `ConfigImpl`. The
+     "No pump selected" exposure is therefore a cross-platform bug and this is a cross-platform fix;
+     verified by the `ios` session on 2026-09-21 at `fbdb19c8e0` (`iosSimulatorArm64Test` 720 tests,
+     0 failures, plus `linkDebugFrameworkIosArm64`).
+
+     **And the depth counter is load-bearing on iOS specifically.** iOS starts at
+     `InitProgress(done = true)` and never runs Android's start-up sequence, so it has nothing that
+     would put the state right again: a window left open there would leave `appInitialized` false for
+     the rest of the process, with no second chance to clear it. Two things protect it and both must
+     stay - `whileReconfiguring`'s `finally`, and `leavingReconfigure`'s clamp at zero. For the same
+     reason `updateInitProgress` / `initCompleted` / `initFailed` on the iOS and desktop configs carry
+     `reconfiguringDepth` through: they replace the whole value rather than copying it, and would
+     otherwise close a window its owner still believes is open.
+
+     **The flag is cheap, and cheaper than it looked.** `Config.appInitialized` is a derived property
+     defined in exactly one place (`Config.kt`, `get() = initProgressFlow.value.done`). Making it
+     `done && !reconfiguring` closes about 35 existing `if (!config.appInitialized)` gates across `app`,
+     `implementation/bolus`, `plugins/{automation,configuration,sync}`, `ui` and `ComposeMainActivity`,
+     with no call-site changes - and without touching `initProgressFlow`, so none of the four splash
+     blockers above apply. Ten of those gates are hand-written defences against this very bug; three of
+     them (`TizenPlugin`, `DataHandlerMobile`, `XdripPlugin`) name `verifySelectionInCategories` in
+     their comments.
+
+     **Constraints on the build, from the same analysis:**
+     - the restore must be a `finally` INSIDE `applySettings()`, ideally a scoped
+       `config.whileApplyingSettings { }` so it cannot be forgotten, and a counter rather than a boolean;
+     - set and clear it INSIDE the `withHold` block, after the wait - otherwise a watch "cancel bolus" is
+       dropped while a bolus is actually delivering;
+     - the wear handlers need a state that ANSWERS the watch ("the phone is reconfiguring, try again");
+       reusing `appInitialized` inherits fifteen silent returns unchanged;
+     - neither flag subsumes the other: all three `isHeld()` guards stay necessary.
+3. ~~**What does "cancel the queued commands" mean**, given that `completeAllAsNoOp` reports
+   `success = true` and the loop reads that as enacted (8.A)?~~ **SETTLED AND BUILT.**
+   `completeAllAsNoOp` no longer exists. `16147121cc` replaced it with
+   `CommandQueue.cancelAll(comment, success)` routed through `Command.cancel`, exactly as the
+   recommendation below proposed, and the import passes `success = false`
+   (`ImportViewModel.applySettings`). `clear()` deliberately keeps `cancelled = false`, because a
+   connection timeout IS a delivery failure and must still raise its alarm.
+   One correction to the recommendation below: it says the alarm cannot be suppressed because
+   "`PumpEnactResult` holds a resolved `String` and every consumer branches on `success`". That was
+   overtaken by `8f13138e29`, which added `PumpEnactResult.cancelled` - a dropped command is now told
+   apart from a failed one, and `CommandQueueImplementation.postProfileWriteResult` returns early on
+   it rather than posting `FAILED_UPDATE_PROFILE`.
+4. **Replace or merge?** **SETTLED 2026-09-22, and the goal is the part to keep hold of: an import must
+   remove the trash left by earlier versions.** That is what `sp.clear()` was for, and it is a real
+   requirement, not an accident of the old code.
+
+   **But a blanket clear cannot do it any more, because it also deletes the pump keys.** `sp.clear()`
+   removes every key not in the file, device state included - pump runtime state
+   (`StringNonKey.PumpCommonBolusStorage`, `PumpCommonTbrStorage`, `BolusInfoStorage`), pump identity
+   and the sync cursors. Those belong to THIS phone and this pump, they are not in the file by design,
+   and restoring another phone's copy of them is the bug 3.1.3 exists to prevent. So the answer is
+   neither "keep the clear" nor "drop the clear and merge": **iterate the stored keys and decide each
+   one.** 3.4 step 6 already says `No sp.clear()`; what was missing is the rule for what iteration
+   removes, and here it is.
+
+   **The rule, per stored key:**
+   - a registered key whose kind is **Setting**: take the value from the file, and **remove it when the
+     file does not have it** - that is what makes this a replace rather than a merge;
+   - a registered key whose kind is **device state**: leave it completely alone, present in the file or
+     not;
+   - a `PrefMigrationDone` marker: leave alone (3.2 owns these);
+   - a key that matches **no** registered key: this is the trash, and it is the reason for the whole
+     decision - but see the two dependencies below before removing any of it.
+
+   **Two dependencies, and neither is optional.** Getting either wrong deletes live data rather than
+   trash, which is worse than leaving the trash alone:
+   - **Every key must already have a kind, enforced.** Removing by kind is only as good as the
+     classification, so this cannot ship before 4.2 step 2 - and specifically not before the
+     classification check 8.D says does not exist yet, because a device-state key mis-marked as a
+     setting is then deleted by design. 4.2 already orders step 3 after step 2; this is why.
+   - **CareLevo and ComboV2 must be off the raw store first** (3.1.2). They read raw today, so some of
+     their live keys match no registered key and would look exactly like trash. They are listed as work
+     in step 2 for other reasons; this promotes it from tidiness to a precondition.
+
+   **And the lookup order has to be written down** (8.B): exact key first, then an **anchored**
+   `ComposedKey` prefix, else never remove. `Preferences.get(key: String)` is exact-match and
+   `isExportableKey`'s prefix match is unanchored, so neither answers this question on its own, and an
+   unanchored match would remove keys that merely share a prefix.
+
+   The consequence that must NOT be undone: for the length of the rewrite every preference reads as its
+   default, safety limits included, which is why the window in decision 2 brackets it.
 5. **ComboV2: device state or pump configuration?** 3.1.3 and 3.1.4 say different things, and the
    answer decides whether the restore checkbox can work at all (8.B).
 
@@ -690,15 +933,39 @@ already stands, and only removes a clause from 3.1.3.
 
 ### 4.2 The order
 
-0. **Re-derive bug 5.11 before spending anything on it.** The Crashlytics path cited there runs
-   through `PersistentNotificationPlugin`, which has been gated by `config.appInitialized` since
-   2026-08-19, so the 19 events may all predate the gate. Check the build ids on the open issue
-   first; if it is already fixed, the finding is a test, not a change.
+0. ~~**Re-derive bug 5.11 before spending anything on it.**~~ **DONE 2026-09-21, and the guess in this
+   step was wrong.** The build ids were checked in the Firebase console. The issue is
+   `PluginStore.getActivePumpInternal` - "No pump selected", **13 events / 6 users**, versions
+   `4.0.0-dev`..`dev-c`, newest event 2026-09-16, tagged "Regressed issue". `4.0.0-dev-c` was created
+   2026-09-08, **after** the 2026-08-19 gate, and 8 of the 13 events are on it - so the events do NOT
+   predate the gate. Reading the crashing source at that tag, the `if (!config.appInitialized) return`
+   guard was present and was PASSED, i.e. the flag was true: this is a plugin restarted during a
+   settings import, not a start up. **So it is a change, not a test** - see 4.1 decision 2 for the
+   design. A test was added anyway (`PluginStoreActivePumpTest`), but it pins only that the getter
+   answers without writing; it does not fix this crash and says so.
 1. **Make the plugin lifecycle honest.** `SupervisorJob` and a lifetime scope on `PluginBase`;
    `onStop` undoing `onStart` for the plugins that do not; `verifySelectionInCategories` returning
    its jobs; the foreground-service case; the scan test widened past `onStart` (all of 8.A). This
    was phase 4 and has to come first: the stop/write/start primitive, the import and the restart all
    stand on it, and today it cannot carry them.
+
+   **Status 2026-09-21 - mostly built, one item left.** Done and CI-green on `dev`: the private
+   `lifecycleScope` with a `SupervisorJob` and a handler, plus a handler on `pluginScope`
+   (`3761a48629`, `430982af5f`); `verifySelectionInCategories` returning its jobs and no longer
+   writing from a getter (`a37f6e81e1`); the foreground-service restart (`133e9f875b`); the scan test
+   widened, including a `pluginScope.launch` inventory with a per-site decision and a launch count
+   (`6951fb7a7e`, `1cc844c8e4`); transitions serialised under a lock (`9344233e5b`); plan bug 12
+   (`ea560ad5e8`); the three `isHeld()` guards (`21570ca902`).
+
+   **Left:** (a) the plugin-state quiet point - 4.1 decision 2, the one users are hitting; (b) four
+   `survivesStop` entries in `PluginLifetimeWorkScanTest`, worst `LoopPlugin#invoke`'s
+   `appScope.launch { delay(1000); invoke(...) }`, which reschedules a loop run into the restart
+   window. Note (a) is a *blocker for 3.5 step 3*, so step 3 is still gated.
+
+   **Settled while doing this, and not to be re-opened:** making `pluginScope` per-enable was proposed
+   and rejected - cancelling it does not withdraw a queued command, so 12 of the 14 launch sites would
+   lose their result without preventing anything, and `OmnipodDashPumpPlugin.handleCommandConfirmation`
+   must not be cancelled at all. The reasoning is on the `pluginScope` declaration.
 2. **Keys: registration and classification, with `kind` enforced by the build.** The `exportable`
    audit, the allowlist, the commit write (3.1); the three pump-state keys that live in `:core:keys`
    and that a module-owner classifier cannot see (8.B); CareLevo and ComboV2 off the raw store
@@ -726,27 +993,83 @@ allowed; shipping 3 before 1 and 2 is not.
 5. Pump runtime state, pump identity and sync cursors are exportable, so every import restores
    another time's or another phone's state (the old import that restarted the app did the same).
    After this plan: pump state only through the checkbox, identity and cursors never.
+
+   **The runtime-state third of this is FIXED, 2026-09-22.** `StringNonKey.BolusInfoStorage`,
+   `PumpCommonBolusStorage` and `PumpCommonTbrStorage` are now `exportable = false`. They are short
+   lived caches of what is in flight to THIS pump, so another phone's copy landing here would be
+   matched against this pump's history. They still survive a restart - that is the preference store,
+   which `exportable` never had anything to do with.
+
+   Done in the same change, because it is the same three keys:
+   - **XStream is gone from the repository.** `PumpSyncStorage` was its only user anywhere, and it
+     needed `AnyTypePermission.ANY` - the setting that switches the type allowlist off - on data that
+     arrived in an import file. Now kotlinx, with a `Stored*` DTO per entry in the same shape
+     `DetailedBolusInfoStorageImpl` already used.
+   - **The in-memory copy is gone.** It loaded once behind a `storageInitialized` flag, so it never
+     saw an outside change to its own keys and wrote the stale copy back over any that was made. The
+     preference store is now the only copy; reads are once per Medtronic history pass, not a loop.
+   - **Read-modify-write is locked.** The mutation path had no lock at all.
+   - The two XStream keys were renamed (`*_json`), so the new code finds nothing rather than parsing
+     the old XML. The old values are orphans for the trash sweep in 4.1 decision 4 to remove.
+
+   Identity and cursors are untouched and still open.
 6. Today's import decides "pump changed" from a live serial that Dana and Diaconn keep empty until
    the next connection, so it may take that path for an unchanged pump (section 1; small effect).
-7. `LoopPlugin` and `OmnipodErosPumpPlugin` leak background work on a stop and start.
+7. **PARTLY FIXED.** `LoopPlugin` and `OmnipodErosPumpPlugin` leak background work on a stop and
+   start. Done: `LoopPlugin`'s collectors are held in `collectors` and cancelled in `onStop`
+   (`bec12877b2`); `OmnipodErosPumpPlugin.onStop` removes its `loopHandler` callbacks, deliberately
+   without quitting the looper (`4d8d7e2ff3`); `XdripPlugin` removes callbacks before `quitSafely`
+   (`334b25b628`). **Still leaking:** the four entries in
+   `PluginLifetimeWorkScanTest.survivesStop` - worst `LoopPlugin#invoke`'s
+   `appScope.launch { delay(1000); invoke(...) }`, which reschedules a loop run one second later,
+   inside the restart window. That list is the worklist and should only ever get shorter.
 8. `DesktopSp.persist()` rewrites the file in place; a crash can leave it truncated.
 9. `InstaraStringKey.DeviceMetaJson` KDoc versus its `exportable`; `GoogleDriveRefreshToken` is
    exported (check whether intended).
 10. Stale comments: `PluginBaseWithPreferences.beforeImport`/`afterImport` KDoc says the app
     restarts after an import; the `MainApp` comment about field injection before `doMigrations`;
     the `IntentKey` KDoc list (`SmsIntentKey` is in `:plugins:sync` now).
-11. `ConfigBuilderImpl.loadSettings()` launches every plugin's `onStart` before
+11. **STILL LIVE, and re-measured 2026-09-21 - the cause below was only half right.**
+    `ConfigBuilderImpl.loadSettings()` launches every plugin's `onStart` before
     `activePlugin.verifySelectionInCategories()` picks the active plugins, so a plugin that reads
     the active pump in `onStart` can hit `PluginStore.activePumpInternal`'s "No pump selected".
-    Live: Crashlytics `PluginStore.getActivePumpInternal`, 19 events on 9 users, 4.0.0-dev to
-    4.0.0-dev-c, last seen 2026-09-16, through `PersistentNotificationPlugin.onStart` ->
-    `triggerNotificationUpdate` -> `ProcessedTbrEbData` ->
-    `PumpWithConcentrationImpl.isFakingTempsByExtendedBoluses`. `PersistentNotificationPlugin`,
-    `XdripPlugin` and `TizenPlugin` guard it with `config.appInitialized`, which helps at startup
-    only - during an import the flag is already true (3.5 step 3).
-12. The two start paths give different guarantees: `initialize()` does not wait for the plugin
-    start jobs, `applyConfiguration()` does (bounded by `PLUGIN_SETTLE_WAIT`). The lifecycle
-    contract in 3.5 should hold for both, or startup keeps the race that 11 describes.
+    Crashlytics `PluginStore.getActivePumpInternal`: **13 events on 6 users** (not 19/9 - that
+    figure was from a wider window), `4.0.0-dev`..`dev-c`, newest 2026-09-16, through
+    `PersistentNotificationPlugin.onStart` -> `triggerNotificationUpdate` -> `ProcessedTbrEbData` ->
+    `PumpWithConcentrationImpl.isFakingTempsByExtendedBoluses`.
+
+    What the build ids showed: the `config.appInitialized` guard was PRESENT in the crashing builds
+    and was **passed**, so this is **not** the start-up ordering above - it is the import window,
+    where the flag is already true. The last sentence of the original entry was the right half.
+    The fix is 4.1 decision 2, and it is **not** to soften `PluginStore`'s assertions (deliberate -
+    see the comment block above the interface section there) nor to clear `initProgressFlow.done`
+    (that is the splash gate; seven blockers). Blocker for 3.5 step 3.
+
+    **Corrected 2026-09-21 (second pass).** How the throw became a crash: those builds subscribed with
+    RxJava - `.subscribe({ triggerNotificationUpdate() }, fabricPrivacy::logException)` - and a throw
+    from an RxJava `onNext` lambda does **not** reach the `onError` beside it. It is wrapped as an
+    `UndeliverableException` and rethrown on the scheduler thread, ending the process. `202ad40fba`
+    (2026-08-15) replaced those three subscriptions with `collectResilient`, whose per-emission
+    `catch (Throwable)` swallows it, so **this particular path is closed on `dev` today** - by
+    accident, as a side effect of the Rx-to-Flow migration. Verify against the Crashlytics build ids
+    that no event comes from a build at or after `202ad40fba` before treating it as fixed. The window
+    itself is untouched and decision 2 still has to be built; what changes is that the urgency must be
+    argued from whichever readers are still uncontained, not from this one.
+
+    A `CoroutineStart.UNDISPATCHED` explanation was written for this on 2026-09-21 and is wrong -
+    `collectResilient` catches inside `onEach`, upstream of the `launch`, so `start` cannot let a
+    throw escape. See 4.1 decision 2.
+12. ~~The two start paths give different guarantees.~~ **FIXED, `ea560ad5e8`.** `initialize()` now
+    returns its start jobs instead of dropping them, and `MainApp` waits on them bounded by 30 s -
+    matching `applyConfiguration`'s `PLUGIN_SETTLE_WAIT`. It could not wait internally: it is not
+    `suspend`, and several instrumented tests call it, so the contract is that it hands the jobs back.
+    The wait sits immediately before `runningModeReconciler.start()`, whose startup-drift check reads
+    the active pump - previously against plugins that were enabled but not started. Pinned by
+    `ConfigBuilderImplTest.initialize hands back the jobs its plugins are starting on`, beside the
+    existing `applying the configuration waits for the plugins to start`, so the pair reads as one
+    contract. Note this does **not** fix 11: `loadSettings` still schedules `onStart` before electing,
+    so the ordering is unchanged - what changed is that "plugins have started" is now true when
+    `initialize()` returns.
 
 ## 6. Open questions
 
@@ -839,37 +1162,78 @@ Every item below survived two skeptics who were told to refute it. Each names th
 
 This is the group that reorders the work (4.2 step 1). All of it is about 3.5 step 3.
 
-- **A throwing `onStart` can make every later restart a no-op.** `PluginBase.pluginScope` is
-  `CoroutineScope(Dispatchers.Default + Job())` - a plain `Job`, not a `SupervisorJob` - and it is
-  what `setPluginEnabled` launches `onStart()`/`onStop()` on. One uncaught throw cancels the scope,
-  and a cancelled scope swallows every later `launch` in silence. **Blocker.**
-- **Nothing stops the running loop.** `CalculationExecutor.waitForPrepare` is documented as covering
-  "Only the prepare phase, because the post phase invokes the loop", so neither waiting nor
-  cancelling reaches the enactment. Sub-steps 3 and 4 are not buildable as written. **Blocker.**
-- **`completeAllAsNoOp` tells the loop the cancelled command succeeded.** It completes each queued
-  command with `success(true).enacted(false)`, and `LoopPlugin.invoke` branches on
-  `if (tbrResult.enacted || tbrResult.success)`: it records a temp basal that never happened and
-  then queues an SMB against it. **Blocker.**
-- **`completeAllAsNoOp` also bypasses `Command.cancel`.** It calls `callback?.result(...)?.run()`
-  directly, so `CommandBolus.cancel`/`CommandSMBBolus.cancel` never run and `BolusProgressData`
-  stays started. `CommandQueueImplementation.clear()` does go through `cancel`. One line to fix, and
-  a bug today.
+- ~~**A throwing `onStart` can make every later restart a no-op.**~~ **FIXED, `3761a48629`.**
+  `onStart`/`onStop` no longer run on `pluginScope` at all - they run on a private `lifecycleScope`
+  with its own `SupervisorJob` and exception handler, and `runPhase` catches everything a phase can
+  throw, records it in `PluginBase.lastStartFailed` and raises an URGENT notification. `pluginScope`
+  also carries a `SupervisorJob` now, plus a handler (`430982af5f`) - without one a throwing plugin
+  launch reached the thread's default handler and ended the process. A failed pump driver reports
+  `isInitialized() == false` through `PumpWithConcentrationImpl`, so the dosing gates refuse it.
+- ~~**Nothing stops the running loop.**~~ **ADDRESSED, `21570ca902` - by not trying to stop it.**
+  `CalculationExecutor.waitForPrepare` still covers only the prepare phase, so waiting for a running
+  enactment remains impossible and waiting for it under the hold still deadlocks (`withHold` raises the
+  flag before it waits, so the loop's second queue call is never picked up). The answer was to stop a
+  NEW enactment from starting instead: `&& !commandQueue.isHeld()` in `LoopPlugin.invoke`, and early
+  returns in `LoopPlugin.acceptChangeRequest` (which enacts outside `invokeMutex` and is reachable from
+  the watch) and `RunningModeReconciler.issueZeroTbrIfNeeded` (worst of the three - a hold granted
+  between its `cancelExtended()` and its zero TBR leaves full basal running while the app believes the
+  pump is suspended). Sub-steps 3 and 4 are buildable once reworded this way.
+- ~~**Plugin state is not quiet during an import, and nothing says so.**~~ **BUILT 2026-09-22,
+  `2601f19fe6`; the blocker on 3.5 step 3 is lifted.** The finding was right: the hold covers the
+  command queue and does nothing about a plugin restarted by `loadSettings` reading an active plugin
+  mid-election. `Config` now carries a reconfiguration window - `appInitialized` is
+  `done && !reconfiguring`, so the ~35 call sites that already guard on it close during an import with
+  no change of their own, and `awaitInitialized` waits on the same condition instead of on `done`
+  alone. See 4.1 decision 2 for the design, what must not be undone, and the two things it is NOT:
+  clearing `initProgressFlow.done`, or softening `PluginStore`'s assertions.
+- ~~**`completeAllAsNoOp` tells the loop the cancelled command succeeded.**~~ **FIXED, `16147121cc`.**
+  Replaced by `cancelAll(comment, success)` routed through `Command.cancel`, with the import passing
+  `success = false`. The last caller that still passed `true` - `CommandExecutor`, when the pump is
+  selected but not configured - was flipped in `a837bb1f86`; it had been persisting the accompanying
+  carbs for insulin that never left the pump, because `bolus()` writes them on a successful result.
+  `PumpEnactResult.cancelled` (`8f13138e29`) keeps all of this silent: a dropped command is told apart
+  from a failed one, so nothing raises the delivery alarm. `clear()` deliberately keeps
+  `cancelled = false`, because a connection timeout IS a delivery failure and must still alarm.
+- ~~**`completeAllAsNoOp` also bypasses `Command.cancel`.**~~ **FIXED with the bullet above,
+  `16147121cc`** - it went unmarked. `completeAllAsNoOp` has no occurrences left anywhere;
+  `cancelAll` is `drain(comment, success, cancelled = true)`, and `drain` calls
+  `queue[i].cancel(comment, success, cancelled)` on every entry. So `CommandBolus.cancel` /
+  `CommandSMBBolus.cancel` do run and `BolusProgressData` is stopped.
 - **Stopping `PersistentNotificationPlugin` stops the foreground service.** `onStop()` calls
   `dummyServiceHelper.stopService(context)`, and `DummyService` is what keeps AAPS out of the
   background execution limits. The plugin is `alwaysEnabled`, so "stop every enabled plugin"
-  includes it, and `onStart` does not start the service again.
+  includes it, and `onStart` does not start the service again. **Done**: `onStart` now starts it,
+  deferred and idempotent - the missing half of this plugin's own `onStop`. Exempting `alwaysEnabled`
+  plugins from the sweep was the alternative and was rejected: it would leave the plugin running while
+  everything it reports on is restarting, and the asymmetry would still be there for anything else
+  that stops a service.
 - **`verifySelectionInCategories` starts plugins itself and drops the jobs**, for six categories. So
   "start every plugin, awaited" is unreachable however the calls are ordered, and the note added
   earlier to 3.5 was wrong to suggest that reordering alone fixes it. It has to return its jobs, and
-  `activePumpInternal`'s fallback has to stop enabling plugins from inside a getter.
-- **The scan test looks in the wrong place.** The work that survives a stop is launched from ordinary
-  methods, not from `onStart`: `LoopPlugin.invoke` ends its SMB branch with
+  `activePumpInternal`'s fallback has to stop **disabling** plugins from inside a getter. (Corrected
+  2026-09-21: this bullet said "enabling". The fallback calls `getTheOneEnabledInArray`, which keeps
+  the first enabled pump and disables every later one - a write, and dropped `onStop` jobs, during a
+  property read.) **Both done**: `verifySelectionInCategories` returns `List<Job>`, `loadSettings`
+  adds them to the list `applyConfiguration` already waits on, and the getter is a pure read.
+- **No scan test exists.** 3.5 step 3 and an earlier version of this bullet read as though one did.
+  When it is written it must scan the whole plugin class, not `onStart`: the work that survives a stop
+  is launched from ordinary methods, and `LoopPlugin.invoke` ends its SMB branch with
   `appScope.launch { delay(1000); invoke(...) }`, which lands inside or just after the restart window
-  and queues pump commands. Scan the whole plugin class for `appScope`, `postDelayed`, `Handler`,
-  `Thread(` and raw `CoroutineScope(`.
-- **Two pump-safety singletons outside plugins are missing from the reload list** (3.5 step 2):
+  and queues pump commands. **Done**: `PluginLifetimeWorkScanTest` in `:app/src/testFull`. It looks for
+  `appScope`, `GlobalScope`, `postDelayed`, `Handler(`/`Thread(` across the whole class and makes every
+  hit declare itself either reviewed-safe or survives-stop. Two limits worth knowing: it reads source
+  text, so it cannot see work a helper class schedules on the plugin's behalf, and it does not look at
+  `WorkManager` or `AlarmManager`, which outlive the process and are a separate problem. Raw
+  `CoroutineScope(` is deliberately not matched - created in `onStart` and cancelled in `onStop` is the
+  correct idiom that 25 plugins already use, and flagging it buried the real hits in noise.
+- ~~**Two pump-safety singletons outside plugins are missing from the reload list** (3.5 step 2):
   `PumpSyncStorage`, guarded by a one-shot `storageInitialized` flag, and
-  `DetailedBolusInfoStorageImpl`.
+  `DetailedBolusInfoStorageImpl`.~~ **CLOSED 2026-09-22 for `PumpSyncStorage` - not satisfied,
+  removed.** It has no in-memory copy any more, so there is nothing to reload: every call reads the
+  preference. The `storageInitialized` flag it was guarded by is gone with it. See 5.5.
+  `DetailedBolusInfoStorageImpl` still holds its list, loaded once in a property initializer, so it
+  keeps the same shape of problem and stays on the list - it is smaller (at most two entries, already
+  locked, already kotlinx) and the same treatment applies.
 
 ### 8.B The import: classification and semantics
 
@@ -890,11 +1254,12 @@ This is the group that reorders the work (4.2 step 1). All of it is about 3.5 st
   `ConfigBuilder_PUMP_DanaRSPlugin_Enabled`, which survives the filter, is renamed by the legacy step
   and is then written - with the checkbox unticked. **Swap steps 1 and 2: migrate the whole map
   first, then classify and drop.**
-- **Dropping `sp.clear()` turns the import from replace into merge.** `PrefsTransfer.applyImported`
-  documents why the clear exists: "A setting the old configuration had and the new one does not would
-  otherwise survive an import that was meant to replace it." The plan removes it and never says what
-  happens to a setting missing from the file. This needs a removal rule in step 6, not the blanket
-  clear back.
+- ~~**Dropping `sp.clear()` turns the import from replace into merge.**~~ **ANSWERED - see 4.1
+  decision 4.** The finding was right: `PrefsTransfer.applyImported` documents why the clear exists
+  ("A setting the old configuration had and the new one does not would otherwise survive an import
+  that was meant to replace it"), and the plan removed it without saying what happens to a setting
+  missing from the file. The removal rule now exists in decision 4, and it is per-key iteration rather
+  than the blanket clear back, because the clear also deletes the pump keys.
 - **Phase 0 was unsafe for a reason the gate did not cover.** Today's import calls `sp.clear()`,
   which deletes every key *not* in the file - device state included - so `reloadFromStore()` would
   publish those deletions into live flows. Both branches of the gate written earlier missed this.
